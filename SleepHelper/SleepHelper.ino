@@ -65,7 +65,8 @@ Adafruit_VEML7700 veml;
 Adafruit_SHT31    sht31;
 
 // For 2.9" 296x128 display swap to: Adafruit_SSD1680 display(296, 128, ...)
-Adafruit_SSD1675 display(212, 104, EPD_DC, EPD_RESET, EPD_CS, EPD_BUSY, &SPI);
+// Hardware SPI is used by default — no SPI pins needed in the constructor.
+Adafruit_SSD1675 display(212, 104, EPD_DC, EPD_RESET, EPD_CS, EPD_BUSY);
 
 // ── STATE ────────────────────────────────────────────────────────────────────
 float         dailyScoreSum  = 0;
