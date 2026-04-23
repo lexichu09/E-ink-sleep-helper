@@ -7,15 +7,14 @@
 
   Hardware assumed:
     - Adafruit Feather ESP32-S3 (or any ESP32 Feather with WiFi)
-    - Adafruit 2.13" Monochrome eInk FeatherWing (212 x 104)
-      → If you have a 2.9" (296x128) use Adafruit_SSD1680 instead
+    - Adafruit 2.13" Mono eInk FeatherWing — GDEY0213B74 (250 x 122)
     - VEML7700 lux sensor on I2C
     - SHT31 temp/humidity sensor on I2C (address 0x44)
 
   Required libraries (install via Arduino Library Manager):
     - Adafruit VEML7700
     - Adafruit SHT31
-    - Adafruit EPD
+    - Adafruit ThinkInk   ← replaces Adafruit EPD
     - Adafruit GFX
     - ArduinoJson  (≥ v6)
     - WiFi         (built-in for ESP32)
@@ -28,8 +27,7 @@
 #include <time.h>
 #include "Adafruit_VEML7700.h"
 #include "Adafruit_SHT31.h"
-#include "Adafruit_EPD.h"
-#include <Adafruit_GFX.h>
+#include "Adafruit_ThinkInk.h"
 
 // ── USER CONFIG ──────────────────────────────────────────────────────────────
 const char* WIFI_SSID     = "YOUR_SSID";
@@ -37,19 +35,19 @@ const char* WIFI_PASSWORD = "YOUR_PASSWORD";
 const char* GROQ_API_KEY  = "YOUR_GROQ_API_KEY";
 
 // UTC offset in seconds: EST=-18000, CST=-21600, MST=-25200, PST=-28800
-const long  GMT_OFFSET_SEC  = -18000;
-const int   DST_OFFSET_SEC  = 3600;  // set to 0 if your region skips daylight saving
+const long  GMT_OFFSET_SEC = -18000;
+const int   DST_OFFSET_SEC = 3600;  // set to 0 if your region skips daylight saving
 
 // How often to refresh the display and request a new AI tip (milliseconds)
 const unsigned long UPDATE_INTERVAL_MS = 5UL * 60 * 1000;  // 5 minutes
 
-// ── E-INK PINS ───────────────────────────────────────────────────────────────
-// These match the Adafruit 2.13" eInk FeatherWing default wiring.
-// Adjust if your board or wing differs.
-#define EPD_CS    9
+// ── E-INK PINS (Adafruit 2.13" ThinkInk FeatherWing GDEY0213B74) ─────────────
 #define EPD_DC    10
-#define EPD_RESET 5
-#define EPD_BUSY  6
+#define EPD_CS     9
+#define EPD_BUSY  -1
+#define SRAM_CS    6
+#define EPD_RESET -1
+#define EPD_SPI  &SPI
 
 // ── SLEEP ENVIRONMENT THRESHOLDS ─────────────────────────────────────────────
 const float IDEAL_TEMP_LOW_C  = 18.0;  // °C  (~64°F)
@@ -64,9 +62,7 @@ const int   NIGHT_END_HOUR    = 7;     // 7 AM
 Adafruit_VEML7700 veml;
 Adafruit_SHT31    sht31;
 
-// For 2.9" 296x128 display swap to: Adafruit_SSD1680 display(296, 128, ...)
-// Hardware SPI is used by default — no SPI pins needed in the constructor.
-Adafruit_SSD1675 display(212, 104, EPD_DC, EPD_RESET, EPD_CS, EPD_BUSY);
+ThinkInk_213_Mono_GDEY0213B74 display(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);
 
 // ── STATE ────────────────────────────────────────────────────────────────────
 float         dailyScoreSum  = 0;
@@ -95,15 +91,15 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
 
-  // Splash on e-ink while everything initialises
-  display.begin();
+  // Splash screen while sensors and WiFi initialise
+  display.begin(THINKINK_MONO);
   display.clearBuffer();
   display.setTextColor(EPD_BLACK);
-  display.setTextWrap(false);
-  display.setTextSize(1);
-  display.setCursor(4, 4);
+  display.setTextSize(2);
+  display.setCursor(10, 40);
   display.print("Sleep Helper");
-  display.setCursor(4, 16);
+  display.setTextSize(1);
+  display.setCursor(10, 70);
   display.print("Starting...");
   display.display();
 
@@ -222,19 +218,19 @@ bool getLocalTimeInfo(struct tm &t) {
 float computeScore(float tempC, float humidity, float lux, int hour) {
   float score = 100.0f;
 
-  // Temperature: ±30 pts, 5 pt/°C outside ideal band
+  // Temperature: up to -30 pts, 5 pts/°C outside ideal band
   if (tempC < IDEAL_TEMP_LOW_C)
     score -= min(30.0f, (IDEAL_TEMP_LOW_C - tempC) * 5.0f);
   else if (tempC > IDEAL_TEMP_HIGH_C)
     score -= min(30.0f, (tempC - IDEAL_TEMP_HIGH_C) * 5.0f);
 
-  // Humidity: ±20 pts, 0.4 pt/%RH outside ideal band
+  // Humidity: up to -20 pts, 0.4 pts/%RH outside ideal band
   if (humidity < IDEAL_HUM_LOW)
     score -= min(20.0f, (IDEAL_HUM_LOW - humidity) * 0.4f);
   else if (humidity > IDEAL_HUM_HIGH)
     score -= min(20.0f, (humidity - IDEAL_HUM_HIGH) * 0.4f);
 
-  // Light: only penalise during sleep window (night hours)
+  // Light: only penalise during the sleep window (night hours)
   bool isNight = (hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR);
   if (isNight && lux > MAX_NIGHT_LUX)
     score -= min(30.0f, (lux - MAX_NIGHT_LUX) * 0.5f);
@@ -250,20 +246,19 @@ String fetchGroqTip(float tempC, float humidity, float lux,
   char userPrompt[512];
   snprintf(userPrompt, sizeof(userPrompt),
     "You are a concise sleep environment coach. "
-    "Sensor data: temperature %.1f°C, humidity %.0f%%, light level %.1f lux. "
-    "Current time: %02d:%02d. Sleep environment score: %.0f out of 100. "
-    "Give exactly ONE actionable tip in 20 words or fewer to improve sleep quality.",
+    "Sensor data: temperature %.1f degrees C, humidity %.0f%%, light %.1f lux. "
+    "Time: %02d:%02d. Sleep environment score: %.0f/100. "
+    "Give ONE actionable tip in 20 words or fewer to improve sleep quality.",
     tempC, humidity, lux, hour, minute, score);
 
-  // Build JSON request body
   StaticJsonDocument<768> reqDoc;
   reqDoc["model"]       = "llama3-8b-8192";
   reqDoc["max_tokens"]  = 60;
   reqDoc["temperature"] = 0.6;
-  JsonArray messages   = reqDoc.createNestedArray("messages");
-  JsonObject msg       = messages.createNestedObject();
-  msg["role"]          = "user";
-  msg["content"]       = userPrompt;
+  JsonArray messages = reqDoc.createNestedArray("messages");
+  JsonObject msg     = messages.createNestedObject();
+  msg["role"]        = "user";
+  msg["content"]     = userPrompt;
 
   String requestBody;
   serializeJson(reqDoc, requestBody);
@@ -274,14 +269,13 @@ String fetchGroqTip(float tempC, float humidity, float lux,
   http.addHeader("Authorization", String("Bearer ") + GROQ_API_KEY);
   http.setTimeout(12000);
 
-  String tip = "No tip available.";
-  int httpCode = http.POST(requestBody);
+  String tip      = "No tip available.";
+  int    httpCode = http.POST(requestBody);
 
   if (httpCode == 200) {
     String responseBody = http.getString();
     StaticJsonDocument<2048> respDoc;
-    DeserializationError err = deserializeJson(respDoc, responseBody);
-    if (!err) {
+    if (!deserializeJson(respDoc, responseBody)) {
       const char* content = respDoc["choices"][0]["message"]["content"];
       if (content) {
         tip = String(content);
@@ -290,14 +284,14 @@ String fetchGroqTip(float tempC, float humidity, float lux,
     }
   } else {
     Serial.printf("Groq API error: HTTP %d\n", httpCode);
-    // Fallback rule-based tip so the display is never empty
+    // Rule-based fallback so the display always shows something useful
     bool isNight = (hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR);
-    if (isNight && lux > 50)       tip = "Dim or turn off nearby lights.";
-    else if (tempC > IDEAL_TEMP_HIGH_C) tip = "Cool the room for better sleep.";
-    else if (tempC < IDEAL_TEMP_LOW_C)  tip = "Add a blanket — room is too cold.";
-    else if (humidity > IDEAL_HUM_HIGH) tip = "Run a dehumidifier tonight.";
-    else if (humidity < IDEAL_HUM_LOW)  tip = "Use a humidifier — air is dry.";
-    else                                tip = "Environment looks good. Sleep well!";
+    if      (isNight && lux > 50)          tip = "Dim or turn off nearby lights.";
+    else if (tempC > IDEAL_TEMP_HIGH_C)    tip = "Cool the room for better sleep.";
+    else if (tempC < IDEAL_TEMP_LOW_C)     tip = "Add a blanket — room is too cold.";
+    else if (humidity > IDEAL_HUM_HIGH)    tip = "Run a dehumidifier tonight.";
+    else if (humidity < IDEAL_HUM_LOW)     tip = "Use a humidifier — air is dry.";
+    else                                   tip = "Environment looks great. Sleep well!";
   }
 
   http.end();
@@ -305,6 +299,7 @@ String fetchGroqTip(float tempC, float humidity, float lux,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Display is 250 wide x 122 tall. Text size 1 = 6x8 px per char (~41 chars/line).
 void renderDisplay(float tempC, float humidity, float lux,
                    int hour, int minute,
                    float currentScore, float dayScore,
@@ -316,33 +311,34 @@ void renderDisplay(float tempC, float humidity, float lux,
   // ── Header ────────────────────────────────────────────────────────────────
   display.setTextSize(1);
   display.setCursor(4, 2);
-  display.printf("Sleep Helper   %02d:%02d", hour, minute);
-  display.drawLine(0, 12, display.width(), 12, EPD_BLACK);
+  display.printf("Sleep Helper        %02d:%02d", hour, minute);
+  display.drawLine(0, 11, display.width(), 11, EPD_BLACK);
 
   // ── Sensor readings ───────────────────────────────────────────────────────
-  display.setCursor(4, 15);
-  display.printf("Temp: %.1fC   Hum: %.0f%%", tempC, humidity);
-  display.setCursor(4, 25);
+  display.setCursor(4, 14);
+  display.printf("Temp: %.1fC    Humidity: %.0f%%", tempC, humidity);
+  display.setCursor(4, 24);
   display.printf("Light: %.1f lux", lux);
-  display.drawLine(0, 35, display.width(), 35, EPD_BLACK);
+  display.drawLine(0, 33, display.width(), 33, EPD_BLACK);
 
   // ── Scores ────────────────────────────────────────────────────────────────
-  display.setCursor(4, 38);
+  display.setTextSize(1);
+  display.setCursor(4, 36);
   display.printf("Now:   %.0f / 100", currentScore);
-  display.setCursor(4, 48);
+  display.setCursor(4, 46);
   display.printf("Today: %.0f / 100", dayScore);
-  display.drawLine(0, 58, display.width(), 58, EPD_BLACK);
+  display.drawLine(0, 55, display.width(), 55, EPD_BLACK);
 
   // ── AI Tip ────────────────────────────────────────────────────────────────
-  display.setCursor(4, 61);
+  display.setCursor(4, 58);
   display.print("Tip:");
-  // 30 chars/line fits comfortably at text size 1 on 212px wide display
-  printWordWrapped(tip, 4, 71, 30, 10, display.height() - 2);
+  // 41 chars/line fits at text size 1 on the 250px wide display
+  printWordWrapped(tip, 4, 68, 41, 10, display.height() - 2);
 
   display.display();
 }
 
-// Simple word-wrap printer for the e-ink canvas
+// ─────────────────────────────────────────────────────────────────────────────
 void printWordWrapped(const String &text, int x, int startY,
                       int maxCharsPerLine, int lineHeight, int maxY) {
   String remaining = text;
@@ -352,7 +348,7 @@ void printWordWrapped(const String &text, int x, int startY,
   while (remaining.length() > 0 && y < maxY) {
     String line;
     if ((int)remaining.length() <= maxCharsPerLine) {
-      line = remaining;
+      line      = remaining;
       remaining = "";
     } else {
       int breakAt = maxCharsPerLine;
