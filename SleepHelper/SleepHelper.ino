@@ -256,8 +256,8 @@ String fetchGroqTip(float tempC, float humidity, float lux,
     "Give ONE actionable tip in 20 words or fewer to improve sleep quality.",
     tempC, humidity, lux, hour, minute, score);
 
-  StaticJsonDocument<768> reqDoc;
-  reqDoc["model"]       = "llama3-8b-8192";
+  StaticJsonDocument<1024> reqDoc;
+  reqDoc["model"]       = "llama-3.1-8b-instant";
   reqDoc["max_tokens"]  = 60;
   reqDoc["temperature"] = 0.6;
   JsonArray messages = reqDoc.createNestedArray("messages");
@@ -289,6 +289,7 @@ String fetchGroqTip(float tempC, float humidity, float lux,
     }
   } else {
     Serial.printf("Groq API error: HTTP %d\n", httpCode);
+    Serial.println(http.getString());  // prints Groq's error message
     // Rule-based fallback so the display always shows something useful
     bool isNight = (hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR);
     if      (isNight && lux > 50)          tip = "Dim or turn off nearby lights.";
