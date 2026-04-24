@@ -13,8 +13,9 @@
 
   Required libraries (install via Arduino Library Manager):
     - Adafruit VEML7700
-    - Adafruit SHT31
-    - Adafruit ThinkInk   ← replaces Adafruit EPD
+    - Adafruit SHT4x
+    - Adafruit Unified Sensor
+    - Adafruit ThinkInk
     - Adafruit GFX
     - ArduinoJson  (≥ v6)
     - WiFi         (built-in for ESP32)
@@ -26,7 +27,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include "Adafruit_VEML7700.h"
-#include "Adafruit_SHT31.h"
+#include "Adafruit_SHT4x.h"
 #include "Adafruit_ThinkInk.h"
 
 // ── USER CONFIG ──────────────────────────────────────────────────────────────
@@ -60,7 +61,7 @@ const int   NIGHT_END_HOUR    = 7;     // 7 AM
 
 // ── OBJECTS ──────────────────────────────────────────────────────────────────
 Adafruit_VEML7700 veml;
-Adafruit_SHT31    sht31;
+Adafruit_SHT4x    sht4x;
 
 ThinkInk_213_Mono_GDEY0213B74 display(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);
 
@@ -109,11 +110,12 @@ void setup() {
   }
   Serial.println("VEML7700 OK");
 
-  if (!sht31.begin(0x44)) {
-    Serial.println("SHT31 not found — check I2C wiring");
+  if (!sht4x.begin()) {
+    Serial.println("SHT45 not found — check I2C wiring");
     while (1) delay(100);
   }
-  Serial.println("SHT31 OK");
+  sht4x.setPrecision(SHT4X_HIGH_PRECISION);
+  Serial.println("SHT45 OK");
 
   connectWiFi();
   syncTime();
@@ -126,12 +128,15 @@ void loop() {
   lastUpdateMs = now;
 
   // --- Read sensors ---
-  float lux      = veml.readLux();
-  float tempC    = sht31.readTemperature();
-  float humidity = sht31.readHumidity();
+  float lux = veml.readLux();
+
+  sensors_event_t humEvent, tempEvent;
+  sht4x.getEvent(&humEvent, &tempEvent);
+  float tempC    = tempEvent.temperature;
+  float humidity = humEvent.relative_humidity;
 
   if (isnan(tempC) || isnan(humidity)) {
-    Serial.println("SHT31 read error — skipping cycle");
+    Serial.println("SHT45 read error — skipping cycle");
     return;
   }
 
