@@ -1,15 +1,19 @@
 /*
   SleepHelper.ino
   ---------------
-  Reads lux (VEML7700), temperature & humidity (SHT31), syncs time via NTP,
+  Reads lux (VEML7700), temperature & humidity (SHT45), syncs time via NTP,
   calls Groq AI for a personalized sleep tip, calculates a daily sleep
   environment score, and shows everything on an e-ink display.
+
+  Updates 4 times a day: 7 AM, 8 PM, 10 PM, 11:59 PM.
+  Between updates the ESP32-S3 is in deep sleep to save power.
+  The e-ink display holds its image without power during sleep.
 
   Hardware assumed:
     - Adafruit Feather ESP32-S3 (or any ESP32 Feather with WiFi)
     - Adafruit 2.13" Mono eInk FeatherWing — GDEY0213B74 (250 x 122)
     - VEML7700 lux sensor on I2C
-    - SHT31 temp/humidity sensor on I2C (address 0x44)
+    - SHT45 temp/humidity sensor on I2C
 
   Required libraries (install via Arduino Library Manager):
     - Adafruit VEML7700
@@ -30,6 +34,8 @@
 #include "Adafruit_SHT4x.h"
 #include "Adafruit_ThinkInk.h"
 
+#define uS_TO_S_FACTOR 1000000ULL  // microseconds → seconds for sleep timer
+
 // ── USER CONFIG ──────────────────────────────────────────────────────────────
 const char* WIFI_SSID     = "YOUR_SSID";
 const char* WIFI_PASSWORD = "YOUR_PASSWORD";
@@ -39,8 +45,10 @@ const char* GROQ_API_KEY  = "YOUR_GROQ_API_KEY";
 const long  GMT_OFFSET_SEC = -18000;
 const int   DST_OFFSET_SEC = 3600;  // set to 0 if your region skips daylight saving
 
-// How often to refresh the display and request a new AI tip (milliseconds)
-const unsigned long UPDATE_INTERVAL_MS = 5UL * 60 * 1000;  // 5 minutes
+// ── SCHEDULED WAKE TIMES ─────────────────────────────────────────────────────
+// Minutes from midnight: 7:00, 20:00, 22:00, 23:59
+const int WAKE_TIMES[]  = { 7*60, 20*60, 22*60, 23*60 + 59 };
+const int WAKE_COUNT    = sizeof(WAKE_TIMES) / sizeof(WAKE_TIMES[0]);
 
 // ── E-INK PINS (Adafruit 2.13" ThinkInk FeatherWing GDEY0213B74) ─────────────
 #define EPD_DC    10
@@ -59,24 +67,24 @@ const float MAX_NIGHT_LUX     = 10.0;  // lux — above this at night hurts scor
 const int   NIGHT_START_HOUR  = 21;    // 9 PM
 const int   NIGHT_END_HOUR    = 7;     // 7 AM
 
+// ── RTC MEMORY — survives deep sleep ─────────────────────────────────────────
+RTC_DATA_ATTR float dailyScoreSum  = 0;
+RTC_DATA_ATTR int   scoreReadings  = 0;
+RTC_DATA_ATTR float lastDailyScore = -1;
+RTC_DATA_ATTR int   lastDayLogged  = -1;
+
 // ── OBJECTS ──────────────────────────────────────────────────────────────────
 Adafruit_VEML7700 veml;
 Adafruit_SHT4x    sht4x;
 
 ThinkInk_213_Mono_GDEY0213B74 display(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);
 
-// ── STATE ────────────────────────────────────────────────────────────────────
-float         dailyScoreSum  = 0;
-int           scoreReadings  = 0;
-float         lastDailyScore = -1;
-int           lastDayLogged  = -1;
-String        lastTip        = "";
-unsigned long lastUpdateMs   = 0;
-
 // ── PROTOTYPES ───────────────────────────────────────────────────────────────
 void   connectWiFi();
 void   syncTime();
 bool   getLocalTimeInfo(struct tm &t);
+long   secondsUntilNextWake(const struct tm &t);
+void   goToSleep(long seconds);
 float  computeScore(float tempC, float humidity, float lux, int hour);
 String fetchGroqTip(float tempC, float humidity, float lux,
                     int hour, int minute, float score);
@@ -88,46 +96,62 @@ void   printWordWrapped(const String &text, int x, int startY,
                         int maxCharsPerLine, int lineHeight, int maxY);
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Deep sleep restarts from setup() every time — loop() is never reached.
 void setup() {
   Serial.begin(115200);
-  while (!Serial) delay(10);
 
-  // Splash screen while sensors and WiFi initialise
+  // Disable NeoPixel power (saves quiescent current during active time too)
+  pinMode(NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_POWER, LOW);
+
+  // Enable I2C / STEMMA QT power for sensors
+  pinMode(I2C_POWER, OUTPUT);
+  digitalWrite(I2C_POWER, HIGH);
+  delay(10);  // let the rail stabilize before talking to sensors
+
+  // ── Display ───────────────────────────────────────────────────────────────
   display.begin(THINKINK_MONO);
-  display.clearBuffer();
-  display.setTextColor(EPD_BLACK);
-  display.setTextSize(2);
-  display.setCursor(10, 40);
-  display.print("Sleep Helper");
-  display.setTextSize(1);
-  display.setCursor(10, 70);
-  display.print("Starting...");
-  display.display();
 
+  // Only show splash screen on first power-on, not on timer wake
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+    display.clearBuffer();
+    display.setTextColor(EPD_BLACK);
+    display.setTextSize(2);
+    display.setCursor(10, 40);
+    display.print("Sleep Helper");
+    display.setTextSize(1);
+    display.setCursor(10, 70);
+    display.print("Starting...");
+    display.display();
+  }
+
+  // ── Sensors ───────────────────────────────────────────────────────────────
   if (!veml.begin()) {
     Serial.println("VEML7700 not found — check I2C wiring");
     while (1) delay(100);
   }
-  Serial.println("VEML7700 OK");
-
   if (!sht4x.begin()) {
     Serial.println("SHT45 not found — check I2C wiring");
     while (1) delay(100);
   }
   sht4x.setPrecision(SHT4X_HIGH_PRECISION);
-  Serial.println("SHT45 OK");
 
+  // ── Network ───────────────────────────────────────────────────────────────
   connectWiFi();
   syncTime();
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-void loop() {
-  unsigned long now = millis();
-  if (lastUpdateMs != 0 && now - lastUpdateMs < UPDATE_INTERVAL_MS) return;
-  lastUpdateMs = now;
+  // ── Get time — if unavailable, sleep 1 hour and retry ────────────────────
+  struct tm timeInfo;
+  if (!getLocalTimeInfo(timeInfo)) {
+    Serial.println("No time available — sleeping 1 hour to retry");
+    goToSleep(3600);
+  }
 
-  // --- Read sensors ---
+  int hour   = timeInfo.tm_hour;
+  int minute = timeInfo.tm_min;
+  int day    = timeInfo.tm_yday;
+
+  // ── Read sensors ──────────────────────────────────────────────────────────
   float lux = veml.readLux();
 
   sensors_event_t humEvent, tempEvent;
@@ -136,27 +160,16 @@ void loop() {
   float humidity = humEvent.relative_humidity;
 
   if (isnan(tempC) || isnan(humidity)) {
-    Serial.println("SHT45 read error — skipping cycle");
-    return;
+    Serial.println("SHT45 read error — sleeping until next scheduled time");
+    goToSleep(secondsUntilNextWake(timeInfo));
   }
 
-  // --- Get time ---
-  struct tm timeInfo;
-  if (!getLocalTimeInfo(timeInfo)) {
-    Serial.println("Time unavailable — skipping cycle");
-    return;
-  }
-  int hour   = timeInfo.tm_hour;
-  int minute = timeInfo.tm_min;
-  int day    = timeInfo.tm_yday;
-
-  // --- Current environment score ---
+  // ── Score ─────────────────────────────────────────────────────────────────
   float currentScore = computeScore(tempC, humidity, lux, hour);
 
-  // --- Accumulate daily score; finalize at midnight ---
+  // Accumulate daily score in RTC memory; finalise at midnight
   dailyScoreSum += currentScore;
   scoreReadings++;
-
   if (hour == 0 && day != lastDayLogged) {
     lastDailyScore = dailyScoreSum / scoreReadings;
     dailyScoreSum  = 0;
@@ -164,25 +177,59 @@ void loop() {
     lastDayLogged  = day;
     Serial.printf("Daily score finalised: %.0f\n", lastDailyScore);
   }
-
-  // Show today's running average until yesterday's final score is ready
   float displayedDayScore = (lastDailyScore >= 0)
                             ? lastDailyScore
                             : (scoreReadings > 0 ? dailyScoreSum / scoreReadings : 0);
 
-  // --- AI tip ---
-  lastTip = fetchGroqTip(tempC, humidity, lux, hour, minute, currentScore);
+  // ── AI tip ────────────────────────────────────────────────────────────────
+  String tip = fetchGroqTip(tempC, humidity, lux, hour, minute, currentScore);
 
-  // --- Update display ---
+  // ── Update display ────────────────────────────────────────────────────────
   renderDisplay(tempC, humidity, lux, hour, minute,
-                currentScore, displayedDayScore, lastTip);
+                currentScore, displayedDayScore, tip);
 
-  // --- Serial log ---
+  // ── Serial log ────────────────────────────────────────────────────────────
   Serial.printf("[%02d:%02d] Lux=%.1f  Temp=%.1fC  Hum=%.0f%%  "
                 "Score=%.0f  DayScore=%.0f\n",
                 hour, minute, lux, tempC, humidity,
                 currentScore, displayedDayScore);
-  Serial.println("Tip: " + lastTip);
+  Serial.println("Tip: " + tip);
+
+  // ── Sleep until next scheduled time ──────────────────────────────────────
+  goToSleep(secondsUntilNextWake(timeInfo));
+}
+
+void loop() {
+  // Never reached — deep sleep in setup() restarts the program each wake
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Returns seconds until the next scheduled wake time.
+// Any target within 2 minutes is treated as already served (push to tomorrow).
+long secondsUntilNextWake(const struct tm &t) {
+  int nowMinutes = t.tm_hour * 60 + t.tm_min;
+
+  long best = -1;
+  for (int i = 0; i < WAKE_COUNT; i++) {
+    long diff = (long)WAKE_TIMES[i] - nowMinutes;
+    if (diff < 2) diff += 1440;  // already past (or just triggered) → tomorrow
+    if (best < 0 || diff < best) best = diff;
+  }
+  // Subtract seconds already elapsed in the current minute for precision
+  return best * 60L - t.tm_sec;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void goToSleep(long seconds) {
+  Serial.printf("Sleeping for %lds (%.1f hrs)\n", seconds, seconds / 3600.0f);
+  Serial.flush();
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  digitalWrite(I2C_POWER, LOW);  // cut STEMMA QT power during sleep
+
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * uS_TO_S_FACTOR);
+  esp_deep_sleep_start();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -289,8 +336,7 @@ String fetchGroqTip(float tempC, float humidity, float lux,
     }
   } else {
     Serial.printf("Groq API error: HTTP %d\n", httpCode);
-    Serial.println(http.getString());  // prints Groq's error message
-    // Rule-based fallback so the display always shows something useful
+    Serial.println(http.getString());
     bool isNight = (hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR);
     if      (isNight && lux > 50)          tip = "Dim or turn off nearby lights.";
     else if (tempC > IDEAL_TEMP_HIGH_C)    tip = "Cool the room for better sleep.";
@@ -328,7 +374,6 @@ void renderDisplay(float tempC, float humidity, float lux,
   display.drawLine(0, 33, display.width(), 33, EPD_BLACK);
 
   // ── Scores ────────────────────────────────────────────────────────────────
-  display.setTextSize(1);
   display.setCursor(4, 36);
   display.printf("Now:   %.0f / 100", currentScore);
   display.setCursor(4, 46);
